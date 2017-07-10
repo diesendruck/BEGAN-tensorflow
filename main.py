@@ -1,4 +1,5 @@
 import numpy as np
+import pdb
 import tensorflow as tf
 
 from trainer import Trainer
@@ -26,8 +27,8 @@ def main(config):
         do_shuffle = False
 
     data_loader = get_loader(
-            data_path, config.batch_size, config.input_scale_size,
-            config.data_format, config.split)
+            data_path, config.input_scale_size, config.data_format,
+            batch_size=config.batch_size, split=config.split)
     trainer = Trainer(config, data_loader)
 
     if config.is_train:

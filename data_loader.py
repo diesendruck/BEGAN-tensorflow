@@ -1,15 +1,18 @@
 import os
+import pdb
+import tensorflow as tf
 from PIL import Image
 from glob import glob
-import tensorflow as tf
 
-def get_loader(root, batch_size, scale_size, data_format, split=None, is_grayscale=False, seed=None):
+def get_loader(root, scale_size, data_format, batch_size=16, split=None, is_grayscale=False, seed=None):
     dataset_name = os.path.basename(root)
     if dataset_name in ['CelebA'] and split:
         root = os.path.join(root, 'splits', split)
 
     for ext in ["jpg", "png"]:
         paths = glob("{}/*.{}".format(root, ext))
+        # NOTE: Restricted set of images.
+        #paths = paths[:5000]
 
         if ext == "jpg":
             tf_decode = tf.image.decode_jpeg
