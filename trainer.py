@@ -7,6 +7,7 @@ import re
 import scipy.misc
 import StringIO
 import sys
+import time
 from collections import deque
 from glob import glob
 from itertools import chain
@@ -26,6 +27,7 @@ class Trainer(object):
         self.dataset = config.dataset
         self.data_path = config.data_path
         self.split = config.split
+        self.coverage_diagnostics = config.coverage_diagnostics
 
         self.beta1 = config.beta1
         self.beta2 = config.beta2
@@ -33,6 +35,7 @@ class Trainer(object):
         self.batch_size = config.batch_size
 
         self.step = tf.Variable(0, name='step', trainable=False)
+        self.step_update = tf.assign(self.step, self.step + 1)
 
         self.g_lr = tf.Variable(config.g_lr, name='g_lr')
         self.d_lr = tf.Variable(config.d_lr, name='d_lr')
@@ -48,6 +51,7 @@ class Trainer(object):
         self.input_scale_size = config.input_scale_size
 
         self.model_dir = config.model_dir
+        self.log_dir = config.log_dir
         self.load_path = config.load_path
 
         self.use_gpu = config.use_gpu
@@ -86,14 +90,19 @@ class Trainer(object):
 
         self.sess = sv.prepare_or_wait_for_session(config=sess_config)
 
-        if not self.is_train:
+        # Train or test, depending on config.
+        if self.is_train and self.load_path is not None:
+            could_load = self.load_checkpoints()
+        elif not self.is_train:
             # dirty way to bypass graph finilization error
             g = tf.get_default_graph()
             g._finalized = False
-
             self.build_test_model()
-
             could_load = self.load_checkpoints()
+
+        # Run diagnostic of coverage loss on real data.
+        if self.coverage_diagnostics:
+            self.coverage_loss_on_real_data()
 
 
     def load_checkpoints(self):
@@ -132,8 +141,12 @@ class Trainer(object):
         self.z = tf.random_uniform(
                 (tf.shape(x)[0], self.z_num), minval=-1.0, maxval=1.0)
         self.z_ot = tf.placeholder(tf.float32, [None, self.z_num], name="z_ot")
-        self.x_ot = tf.placeholder(tf.float32, 
+        self.x_ot_reshaped = tf.placeholder(tf.float32, 
                 [None, self.vectorized_dim], name="x_ot")
+        self.input1_enc = tf.placeholder(tf.float32,
+                [self.batch_size, self.z_num], name='input1_enc')
+        self.input2_enc = tf.placeholder(tf.float32,
+                [self.batch_size, self.z_num], name='input2_enc')
         self.k_t = tf.Variable(0., trainable=False, name='k_t')
 
         G, self.G_var = GeneratorCNN(
@@ -143,10 +156,11 @@ class Trainer(object):
                 self.z_ot, self.conv_hidden_num, self.channel,
                 self.repeat_num, self.data_format, reuse=True)
 
-        d_out, self.D_z, self.D_var = DiscriminatorCNN(
+        d_out, D_z, self.D_var = DiscriminatorCNN(
                 tf.concat([G, x], 0), self.channel, self.z_num, self.repeat_num,
                 self.conv_hidden_num, self.data_format)
         AE_G, AE_x = tf.split(d_out, 2)
+        D_G, self.D_z = tf.split(D_z, 2)
 
         self.G = denorm_img(G, self.data_format)
         self.G_ot = denorm_img(G_ot, self.data_format)
@@ -165,10 +179,14 @@ class Trainer(object):
         self.d_loss_real = tf.reduce_mean(tf.abs(AE_x - x))
         self.d_loss_fake = tf.reduce_mean(tf.abs(AE_G - G))
         self.coverage_loss = tf.reduce_mean(tf.norm(
-            self.G_ot_reshaped - self.x_ot, axis=1)) - 6938
+            self.G_ot_reshaped - self.x_ot_reshaped, axis=1))
+        self.scaled_coverage_loss = (tf.to_float(self.step)/1000000. * 1./7200. *
+                self.coverage_loss)
+        self.coverage_loss_enc = tf.reduce_mean(tf.norm(
+            self.input1_enc - self.input2_enc))
 
         self.d_loss = self.d_loss_real - self.k_t * self.d_loss_fake
-        self.g_loss = self.d_loss_fake + self.coverage_loss
+        self.g_loss = self.d_loss_fake + self.scaled_coverage_loss
         #NOTE: Original
         #self.g_loss = self.d_loss_fake
 
@@ -190,8 +208,9 @@ class Trainer(object):
             tf.summary.scalar("loss/d_loss", self.d_loss),
             tf.summary.scalar("loss/d_loss_real", self.d_loss_real),
             tf.summary.scalar("loss/d_loss_fake", self.d_loss_fake),
-            tf.summary.scalar("loss/coverage_loss", self.coverage_loss),
             tf.summary.scalar("loss/g_loss", self.g_loss),
+            tf.summary.scalar("loss/scaled_coverage_loss", self.scaled_coverage_loss),
+            tf.summary.scalar("loss/coverage_loss", self.coverage_loss),
             tf.summary.scalar("misc/measure", self.measure),
             tf.summary.scalar("misc/k_t", self.k_t),
             tf.summary.scalar("misc/d_lr", self.d_lr),
@@ -202,51 +221,36 @@ class Trainer(object):
 
     def train(self):
         z_fixed = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
-
         x_fixed = self.get_image_from_loader()
         save_image(x_fixed, '{}/x_fixed.png'.format(self.model_dir))
-
         prev_measure = 1
         measure_history = deque([0]*self.lr_update_step, self.lr_update_step)
 
-        # Compute summary of coverage loss on real data.
-        #print(self.coverage_loss_on_real_data())
-
         for step in trange(self.start_step, self.max_step):
-            # BEGIN: Compute optimal transport ordering.
-            # 1. Get Generations for a fixed set of z's.
-            # 2. Get a sample of real data.
-            # 3. Vectorize images for distance calculation.
-            # 4. Calculate distances with Munkres algorithm.
-            # 5. Reorder real samples to optimal transport order, for ordered
-            #    comparison with generated data.
-            # 6. Perform D and G updates (via self.k_update).
+            # Compute a nearest neighbor set of G's and X's.
             z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
-            G_ot = self.sess.run(self.G_ot, {self.z_ot: z_ot})
-            G_ot = np.reshape(G_ot, [self.batch_size, -1])
-            x = self.get_image_from_loader()
-            x = np.reshape(x, [self.batch_size, -1])
-            distances = cdist(G_ot, x)
-            indices = Munkres().compute(distances)
-            x_ot = np.array([x[j] for (i,j) in indices])
-            # END: Compute optimal transport ordering.
+
+            _, x_ot_r = self.get_gen_z_and_nearest_neighbors(z_ot, method='greedy')
 
             fetch_dict = {
                 "k_update": self.k_update,
                 "measure": self.measure,
             }
+
             if step % self.log_step == 0:
                 fetch_dict.update({
                     "summary": self.summary_op,
+                    "scaled_coverage_loss": self.scaled_coverage_loss,
                     "coverage_loss": self.coverage_loss,
                     "g_loss": self.g_loss,
                     "d_loss": self.d_loss,
                     "k_t": self.k_t,
                 })
+
             result = self.sess.run(fetch_dict,
                 feed_dict={
                     self.z_ot: z_ot,
-                    self.x_ot: x_ot})
+                    self.x_ot_reshaped: x_ot_r})
 
             measure = result['measure']
             measure_history.append(measure)
@@ -255,14 +259,15 @@ class Trainer(object):
                 self.summary_writer.add_summary(result['summary'], step)
                 self.summary_writer.flush()
 
+                scaled_coverage_loss = result['scaled_coverage_loss']
                 coverage_loss = result['coverage_loss']
                 g_loss = result['g_loss']
                 d_loss = result['d_loss']
                 k_t = result['k_t']
 
-                print("[{}/{}] Loss_D: {:.3f} Loss_G: {:.3f} Loss_COV: {:.3f} measure: {:.3f}, k_t: {:.3f}". \
-                    format(step, self.max_step, d_loss, g_loss, coverage_loss,
-                        measure, k_t))
+                print("[{}/{}] Loss_D: {:.4f} Loss_G: {:.4f} Loss_scvg,cvg: {:.4f},{:.4f} measure: {:.4f}, k_t: {:.4f}". \
+                    format(step, self.max_step, d_loss, g_loss,
+                        scaled_coverage_loss, coverage_loss, measure, k_t))
 
             if step % (self.log_step * 10) == 0:
                 x_fake = self.generate(z_fixed, self.model_dir, idx=step)
@@ -274,18 +279,20 @@ class Trainer(object):
                 #if cur_measure > prev_measure * 0.99:
                 #prev_measure = cur_measure
 
+            self.sess.run(self.step_update)
 
     def build_test_model(self):
         with tf.variable_scope("test") as vs:
             # Extra ops for interpolation
             z_optimizer = tf.train.AdamOptimizer(0.0001)
-
             self.z_r = tf.get_variable("z_r", [self.batch_size, self.z_num], tf.float32)
             self.z_r_update = tf.assign(self.z_r, self.z)
 
         G_z_r, _ = GeneratorCNN(
-                self.z_r, self.conv_hidden_num, self.channel, self.repeat_num, self.data_format, reuse=True)
+                self.z_r, self.conv_hidden_num, self.channel,
+                self.repeat_num, self.data_format, reuse=True)
 
+        # Optimize z so that G(z) matches X. Give z_r as preimage of x.
         with tf.variable_scope("test") as vs:
             self.z_r_loss = tf.reduce_mean(tf.abs(self.x - G_z_r))
             self.z_r_optim = z_optimizer.minimize(self.z_r_loss, var_list=[self.z_r])
@@ -327,6 +334,7 @@ class Trainer(object):
 
 
     def decode(self, z):
+        # NOTE: This may be wrong. self.D_z is not an ancestor of self.AE_x.
         return self.sess.run(self.AE_x, {self.D_z: z})
 
 
@@ -334,9 +342,12 @@ class Trainer(object):
         batch_size = len(real_batch)
         half_batch_size = int(batch_size/2)
 
+        # Optimize z so that G(z) matches X. Give z_r as preimage of x.
+        # When train_epoch=0, z = self.z_r = self.z, as defined in build_model().
         self.sess.run(self.z_r_update)
         tf_real_batch = to_nchw_numpy(real_batch)
         for i in trange(train_epoch):
+            print('Optimizing z as preimage of sampled real batch.')
             z_r_loss, _ = self.sess.run([self.z_r_loss, self.z_r_optim], {self.x: tf_real_batch})
         z = self.sess.run(self.z_r)
 
@@ -348,10 +359,10 @@ class Trainer(object):
             z = np.stack([slerp(ratio, r1, r2) for r1, r2 in zip(z1, z2)])
             z_decode = self.generate(z, save=False)
             generated.append(z_decode)
-
         generated = np.stack(generated).transpose([1, 0, 2, 3, 4])
-        for idx, img in enumerate(generated):
-            save_image(img, os.path.join(root_path, 'test{}_interp_G_{}.png'.format(step, idx)), nrow=10)
+
+        #for idx, img in enumerate(generated):
+        #    save_image(img, os.path.join(root_path, 'test{}_interp_G_{}.png'.format(step, idx)), nrow=10)
 
         all_img_num = np.prod(generated.shape[:2])
         batch_generated = np.reshape(generated, [all_img_num] + list(generated.shape[2:]))
@@ -365,6 +376,7 @@ class Trainer(object):
         decodes = []
         for idx, ratio in enumerate(np.linspace(0, 1, 10)):
             z = np.stack([slerp(ratio, r1, r2) for r1, r2 in zip(real1_encode, real2_encode)])
+            # NOTE: This may be wrong. self.D_z is not an ancestor of self.AE_x.
             z_decode = self.decode(z)
             decodes.append(z_decode)
 
@@ -385,30 +397,27 @@ class Trainer(object):
             real1_batch = self.get_image_from_loader()
             real2_batch = self.get_image_from_loader()
 
-            save_image(real1_batch, os.path.join(root_path,
-                'test{}_real1.png'.format(step)))
-            save_image(real2_batch, os.path.join(root_path,
-                'test{}_real2.png'.format(step)))
+            #save_image(real1_batch, os.path.join(root_path,
+            #    'test{}_real1.png'.format(step)))
+            #save_image(real2_batch, os.path.join(root_path,
+            #    'test{}_real2.png'.format(step)))
 
-            self.autoencode(
-                real1_batch, self.model_dir, 
-                idx=os.path.join(root_path, "test{}_real1".format(step)))
-            self.autoencode(
-                real2_batch, self.model_dir,
-                idx=os.path.join(root_path, "test{}_real2".format(step)))
+            #self.autoencode(
+            #    real1_batch, root_path, idx="test{}_real1".format(step))
+            #self.autoencode(
+            #    real2_batch, root_path, idx="test{}_real2".format(step))
 
-            self.interpolate_G(real1_batch, step, root_path)
+            self.interpolate_G(real1_batch, step, root_path, train_epoch=1000)
             #self.interpolate_D(real1_batch, real2_batch, step, root_path)
 
             z_fixed = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
-            G_z = self.generate(z_fixed,
-                path=os.path.join(root_path, "test{}_G_z.png".format(step)))
+            G_z = self.generate(z_fixed, root_path=root_path, 
+                idx="test{}_z_fixed".format(step), save=False)
 
             if all_G_z is None:
                 all_G_z = G_z
             else:
                 all_G_z = np.concatenate([all_G_z, G_z])
-            save_image(all_G_z, os.path.join(root_path, 'G_z{}.png'.format(step)))
 
         save_image(all_G_z, os.path.join(root_path, 'all_G_z.png'), nrow=16)
 
@@ -421,48 +430,139 @@ class Trainer(object):
 
 
     def coverage_loss_on_real_data(self):
-        print("Sample size: {}, 10 runs".format(self.batch_size))
-        print("Getting real cvg losses...")
+        if not self.load_path:
+            raise ValueError(('[!] This test requires a load_path to fetch an '
+                'existing encoder. None found.'))
+
         from numpy import linalg as LA
-        real_cvg_losses = []
-        for _ in range(100):
+        num_runs = 100
+
+        print("[*] real-real cvg losses...")
+        rr_cvg_losses = []
+        for _ in range(num_runs):
             x1 = self.get_image_from_loader()
             x2 = self.get_image_from_loader()
             x1r = np.reshape(x1, [self.batch_size, -1])
             x2r = np.reshape(x2, [self.batch_size, -1])
             distances = cdist(x1r, x2r)
-            indices = Munkres().compute(distances)
-            x2r_ot = np.array([x2r[j] for (i,j) in indices])
-            coverage_loss = np.mean(LA.norm(x1r - x2r_ot, axis=1))
-            real_cvg_losses.append(coverage_loss)
+            x2r_ot = self.optimal_transport(distances, x2r, method='greedy') 
+            rr_coverage_loss = np.mean(LA.norm(x1r - x2r_ot, axis=1))
+            rr_cvg_losses.append(rr_coverage_loss)
 
-        print("Getting gen cvg losses...")
-        gen_cvg_losses = []
-        for _ in range(100):
+        print("[*] gen-real cvg losses...")
+        gr_cvg_losses = []
+        for _ in range(num_runs):
             z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
             G_ot = self.sess.run(self.G_ot, {self.z_ot: z_ot})
             x = self.get_image_from_loader()
             G_ot_r = np.reshape(G_ot, [self.batch_size, -1])
             x_r = np.reshape(x, [self.batch_size, -1])
             distances = cdist(G_ot_r, x_r)
-            indices = Munkres().compute(distances)
-            x_ot = np.array([x_r[j] for (i,j) in indices])
+            x_ot_r = self.optimal_transport(distances, x_r, method='greedy') 
 
-            coverage_loss = self.sess.run(self.coverage_loss,
+            gr_coverage_loss = self.sess.run(self.coverage_loss,
                 feed_dict={
                     self.G_ot_reshaped: G_ot_r,
-                    self.x_ot: x_ot})
-            gen_cvg_losses.append(coverage_loss)
+                    self.x_ot_reshaped: x_ot_r})
+            gr_cvg_losses.append(gr_coverage_loss)
 
+        print("[*] encoded real-real cvg losses...")
+        enc_rr_cvg_losses = []
+        for _ in range(num_runs):
+            x1 = self.get_image_from_loader()
+            x2 = self.get_image_from_loader()
+            x1_enc = self.encode(x1)
+            x2_enc = self.encode(x2)
+            distances = cdist(x1_enc, x2_enc)
+            x2_enc_ot = self.optimal_transport(distances, x2_enc, method='greedy') 
+            enc_rr_coverage_loss = np.mean(LA.norm(x1_enc - x2_enc_ot, axis=1))
+            enc_rr_cvg_losses.append(enc_rr_coverage_loss)
+
+        print("[*] encoded gen-real cvg losses...")
+        enc_gr_cvg_losses = []
+        for _ in range(num_runs):
+            z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
+            G_ot = self.sess.run(self.G_ot, {self.z_ot: z_ot})
+            x = self.get_image_from_loader()
+            G_enc = self.encode(G_ot)
+            x_enc = self.encode(x)
+            distances = cdist(G_enc, x_enc)
+            x_enc_ot = self.optimal_transport(distances, x_enc, method='greedy') 
+
+            enc_gr_coverage_loss = self.sess.run(self.coverage_loss_enc,
+                feed_dict={
+                    self.input1_enc: G_enc,
+                    self.input2_enc: x_enc_ot})
+            enc_gr_cvg_losses.append(enc_gr_coverage_loss)
+
+
+        print("Sample size: {}, 100 runs".format(self.batch_size))
         print("real-real cvg (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
-            np.min(real_cvg_losses), np.median(real_cvg_losses), np.mean(real_cvg_losses),
-            np.max(real_cvg_losses), np.var(real_cvg_losses)))
-        print("real-gen cvg (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
-            np.min(gen_cvg_losses), np.median(gen_cvg_losses), np.mean(gen_cvg_losses),
-            np.max(gen_cvg_losses), np.var(gen_cvg_losses)))
-        print("\n\n")
+            np.min(rr_cvg_losses), np.median(rr_cvg_losses), np.mean(rr_cvg_losses),
+            np.max(rr_cvg_losses), np.var(rr_cvg_losses)))
+        print("real-gen cvg (min, med, mean,  / max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+            np.min(gr_cvg_losses), np.median(gr_cvg_losses), np.mean(gr_cvg_losses),
+            np.max(gr_cvg_losses), np.var(gr_cvg_losses)))
+        print('\n')
+        print("encoded real-real cvg (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+            np.min(enc_rr_cvg_losses), np.median(enc_rr_cvg_losses), np.mean(enc_rr_cvg_losses),
+            np.max(enc_rr_cvg_losses), np.var(enc_rr_cvg_losses)))
+        print("encoded gen-real cvg (min, med, mean,  / max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+            np.min(enc_gr_cvg_losses), np.median(enc_gr_cvg_losses), np.mean(enc_gr_cvg_losses),
+            np.max(enc_gr_cvg_losses), np.var(enc_gr_cvg_losses)))
+        print("\n")
         sys.exit('ended coverage loss comparison')
-        return None
+
+
+    def optimal_transport(self, distances, x, method='greedy'):
+        # 1. Compute optimal transport/assignment with Greedy or Munkres.
+        # 2. Reorder real samples to optimal transport order, for ordered
+        #    comparison with generated data.
+        # Returns:
+        #   x: Tensor of nearest neighbors to Generated input.
+        if method == 'greedy':
+            num_rows = distances.shape[0]
+            num_cols = distances.shape[1]
+            indices = []
+            d = distances
+            for _ in xrange(num_rows):
+                k = np.argmin(d)
+                min_row = k/num_cols
+                min_col = k%num_rows
+                indices.append((min_row, min_col))
+                # Set entire row and col of min value to Infinity.
+                for i in xrange(num_rows):
+                    d[i][min_col] = float('inf')
+                for j in xrange(num_cols):
+                    d[min_row][j] = float('inf')
+            indices = sorted(indices, key=lambda x: x[0])
+        else:
+            # Munkres() already orders indices by first value.
+            indices = Munkres().compute(distances)
+
+        x_ot = np.array([x[j] for (i,j) in indices])
+        return x_ot
+
+
+    def get_gen_z_and_nearest_neighbors(self, z_ot, dist='pixel', method='greedy'):
+        # 1. Get Generations (or their encodings) for a fixed set of z's.
+        # 2. Get a sample (or their encodings) of real data.
+        # 3. Vectorize images if needed, for distance calculation.
+        # 4. Calculate pair-wise distance matrix, using Euclidean norm.
+        G = self.sess.run(self.G_ot, {self.z_ot: z_ot})
+        x = self.get_image_from_loader()
+        if dist == 'pixel':
+            G = np.reshape(G, [self.batch_size, -1])
+            x = np.reshape(x, [self.batch_size, -1])
+            distances = cdist(G, x)
+            x_ot = self.optimal_transport(distances, x, method)
+            return G, x_ot
+        elif dist == 'encoded':
+            G_enc = self.encode(G_ot) 
+            x_enc = self.encode(x) 
+            distances = cdist(G_enc, x_enc)
+            x_enc_ot = self.optimal_transport(distances, x_enc, method)
+            return G_enc, x_enc_ot
 
 
 def next(loader):

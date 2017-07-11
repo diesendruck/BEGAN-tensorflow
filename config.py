@@ -57,6 +57,7 @@ misc_arg.add_argument('--test_data_path', type=str, default=None,
 misc_arg.add_argument('--sample_per_image', type=int, default=64,
                       help='# of sample per image during test sample generation')
 misc_arg.add_argument('--random_seed', type=int, default=123)
+misc_arg.add_argument('--coverage_diagnostics', type=str2bool, default=False)
 
 def get_config():
     config, unparsed = parser.parse_known_args()
