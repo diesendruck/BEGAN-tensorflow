@@ -515,11 +515,20 @@ class Trainer(object):
 
 
     def optimal_transport(self, distances, x, method='greedy'):
+        # Orders target data set, x, according to optimal transport algorithm.
+        #
         # 1. Compute optimal transport/assignment with Greedy or Munkres.
         # 2. Reorder real samples to optimal transport order, for ordered
         #    comparison with generated data.
+        # Note: The generated data G has an ordering implicit in the distances
+        #   array. This function returns only the reordered target set, x.
+        #
+        # Args:
+        #   distances: A 2D numpy array with pairwise distances
+        #   x: A 2D numpy array of 
         # Returns:
-        #   x: Tensor of nearest neighbors to Generated input.
+        #   x_ot: Tensor of nearest neighbors to Generated input, i.e. a reordering 
+        #      according to optimal transport.
         if method == 'greedy':
             num_rows = distances.shape[0]
             num_cols = distances.shape[1]
