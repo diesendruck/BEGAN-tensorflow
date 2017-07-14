@@ -42,10 +42,8 @@ class Trainer(object):
         self.g_lr = tf.Variable(config.g_lr, name='g_lr')
         self.d_lr = tf.Variable(config.d_lr, name='d_lr')
 
-        self.g_lr_update = tf.assign(self.g_lr,
-                tf.maximum(self.g_lr * 0.5, config.lr_lower_boundary), name='g_lr_update')
-        self.d_lr_update = tf.assign(self.d_lr,
-                tf.maximum(self.d_lr * 0.5, config.lr_lower_boundary), name='d_lr_update')
+        self.g_lr_update = tf.assign(self.g_lr, tf.maximum(self.g_lr * 0.5, config.lr_lower_boundary), name='g_lr_update')
+        self.d_lr_update = tf.assign(self.d_lr, tf.maximum(self.d_lr * 0.5, config.lr_lower_boundary), name='d_lr_update')
 
         self.gamma = config.gamma
         self.lambda_k = config.lambda_k
@@ -149,7 +147,9 @@ class Trainer(object):
 
         self.z = tf.random_uniform(
                 (tf.shape(x)[0], self.z_num), minval=-1.0, maxval=1.0)
-        self.z_ot = tf.placeholder(tf.float32, [None, self.z_num], name='z_ot')
+        self.z_ot = tf.placeholder(tf.float32, [None, self.z_num], name="z_ot")
+        self.x_ot_reshaped = tf.placeholder(tf.float32, 
+                [None, self.vectorized_dim], name="x_ot")
         self.input1_enc = tf.placeholder(tf.float32,
                 [self.batch_size, self.z_num], name='input1_enc')
         self.input2_enc = tf.placeholder(tf.float32,
@@ -181,7 +181,6 @@ class Trainer(object):
         self.AE_G = denorm_img(AE_G, self.data_format)
         self.AE_x = denorm_img(AE_x, self.data_format)
 
-        self.x_ot_reshaped = tf.reshape(x, [self.batch_size, -1], name='x_ot_reshaped') 
         self.G_ot_reshaped = tf.reshape(self.G_ot, [self.batch_size, -1])
 
         if self.optimizer == 'adam':
@@ -193,7 +192,7 @@ class Trainer(object):
 
         # TODO: Figure out if d_losses should be on normed or unnormed.
         self.d_loss_real = tf.reduce_mean(tf.abs(AE_x - x))
-        self.d_loss_fake = tf.reduce_mean(tf.abs(self.AE_G - self.G))
+        self.d_loss_fake = tf.reduce_mean(tf.abs(AE_G - G))
         self.coverage_loss_pixel = tf.reduce_mean(tf.norm(
             self.G_ot_reshaped - self.x_ot_reshaped, axis=1))
         self.coverage_loss_enc_manual = tf.reduce_mean(tf.norm(self.input1_enc -
@@ -201,7 +200,7 @@ class Trainer(object):
         self.coverage_loss_enc = tf.reduce_mean(tf.norm(self.G_enc - self.x_enc))
         self.scaled_coverage_loss = (1./10000. * self.coverage_loss_enc)
         if self.coverage_space == 'pixel':
-            self.coverage_loss = self.coverage_loss_pixel
+            self.coverage_loss = self.coverage_loss_enc
         elif self.coverage_space == 'encoding':
             self.coverage_loss = self.coverage_loss_enc
         else:
@@ -311,8 +310,8 @@ class Trainer(object):
         g_optim_num = 1
 
         # Save current checkpoint.
-        ckpt = tf.train.get_checkpoint_state(self.model_dir)
-        ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+        #ckpt = tf.train.get_checkpoint_state(self.model_dir)
+        #ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
 
         # Do stuff.
         z = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
@@ -327,9 +326,8 @@ class Trainer(object):
 
         for _ in range(g_optim_num):
             self.sess.run(self.g_optim, feed_dict={
-                self.z: z,
-                self.x: to_nchw_numpy(x),
-                self.z_ot: z})
+                self.z_ot: z,
+                self.x: to_nchw_numpy(x_ot)})
 
         G_ = self.sess.run(self.G_ot, {self.z_ot: z})
         G_enc_ = self.encode(G)
@@ -338,9 +336,9 @@ class Trainer(object):
         AE_x_ = self.autoencode(x, self.model_dir)
         
         # Restore original.
-        self.saver.restore(self.sess, os.path.join(self.model_dir, ckpt_name))
-        
-        
+        #self.saver.restore(self.sess, os.path.join(self.load_path,
+        #    ckpt_name))
+
         big_img = np.stack([x, G, G_], 0).transpose([0,2,1,3,4]).reshape([self.input_scale_size * 3,
             self.input_scale_size * self.batch_size, 3])
         big_img = np.rint(big_img).astype(np.uint8)
@@ -679,14 +677,12 @@ class Trainer(object):
         return x_ot
 
 
-    def reorder_x(self, z_ot, x, dist=None, method='greedy'):
+    def reorder_x(self, z_ot, x, dist='encoding', method='greedy'):
         # 1. Get Generations (or their encodings) for a fixed set of z's.
         # 2. Get a sample (or their encodings) of real data.
         # 3. Vectorize images if needed, for distance calculation.
         # 4. Calculate pair-wise distance matrix, using Euclidean norm.
         # NOTE: Argument x is the full image sample.
-        if dist is None:
-            dist = self.coverage_space
         G = self.sess.run(self.G_ot, {self.z_ot: z_ot})
         if dist == 'pixel':
             G_r = np.reshape(G, [self.batch_size, -1])
