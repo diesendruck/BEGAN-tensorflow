@@ -303,8 +303,6 @@ class Trainer(object):
                 #if cur_measure > prev_measure * 0.99:
                 #prev_measure = cur_measure
 
-            self.sess.run(self.step_update)
-
 
     def diagnostic(self):
         g_optim_num = 1
