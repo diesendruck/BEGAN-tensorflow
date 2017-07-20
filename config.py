@@ -1,4 +1,4 @@
-#-*- coding: utf-8 -*-
+#-*- coding: utf-7 -*-
 import argparse
 
 def str2bool(v):
@@ -18,7 +18,7 @@ net_arg.add_argument('--input_scale_size', type=int, default=64,
                      help='input image will be resized with the given value as width and height')
 net_arg.add_argument('--conv_hidden_num', type=int, default=128,
                      choices=[64, 128],help='n in the paper')
-net_arg.add_argument('--z_num', type=int, default=64, choices=[64, 128])
+net_arg.add_argument('--z_num', type=int, default=256, choices=[64, 128, 256])
 
 # Data
 data_arg = add_argument_group('Data')
@@ -39,7 +39,7 @@ train_arg.add_argument('--g_lr', type=float, default=0.00008)
 train_arg.add_argument('--lr_lower_boundary', type=float, default=0.00002)
 train_arg.add_argument('--beta1', type=float, default=0.5)
 train_arg.add_argument('--beta2', type=float, default=0.999)
-train_arg.add_argument('--gamma', type=float, default=0.5)
+train_arg.add_argument('--gamma', type=float, default=1)
 train_arg.add_argument('--lambda_k', type=float, default=0.001)
 train_arg.add_argument('--use_gpu', type=str2bool, default=True)
 
@@ -59,6 +59,9 @@ misc_arg.add_argument('--sample_per_image', type=int, default=64,
 misc_arg.add_argument('--random_seed', type=int, default=123)
 misc_arg.add_argument('--coverage_diagnostics', type=str2bool, default=False)
 misc_arg.add_argument('--coverage_space', type=str, default='encoding', choices=['encoding', 'pixel'])
+misc_arg.add_argument('--coverage_norm_order', type=float, default=2.0)
+misc_arg.add_argument('--train_ae', type=str2bool, default=False)
+misc_arg.add_argument('--train_gan', type=str2bool, default=True)
 
 def get_config():
     config, unparsed = parser.parse_known_args()

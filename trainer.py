@@ -30,6 +30,9 @@ class Trainer(object):
         self.split = config.split
         self.coverage_diagnostics = config.coverage_diagnostics
         self.coverage_space = config.coverage_space
+        self.coverage_norm_order = config.coverage_norm_order
+        self.train_ae = config.train_ae
+        self.train_gan = config.train_gan
 
         self.beta1 = config.beta1
         self.beta2 = config.beta2
@@ -42,8 +45,10 @@ class Trainer(object):
         self.g_lr = tf.Variable(config.g_lr, name='g_lr')
         self.d_lr = tf.Variable(config.d_lr, name='d_lr')
 
-        self.g_lr_update = tf.assign(self.g_lr, tf.maximum(self.g_lr * 0.5, config.lr_lower_boundary), name='g_lr_update')
-        self.d_lr_update = tf.assign(self.d_lr, tf.maximum(self.d_lr * 0.5, config.lr_lower_boundary), name='d_lr_update')
+        self.g_lr_update = tf.assign(self.g_lr, tf.maximum(self.g_lr * 0.5,
+            config.lr_lower_boundary), name='g_lr_update')
+        self.d_lr_update = tf.assign(self.d_lr, tf.maximum(self.d_lr * 0.5,
+            config.lr_lower_boundary), name='d_lr_update')
 
         self.gamma = config.gamma
         self.lambda_k = config.lambda_k
@@ -142,11 +147,16 @@ class Trainer(object):
 
 
     def build_model(self):
+        # Inputs.
         self.x = self.data_loader
         x = norm_img(self.x)
 
         self.z = tf.random_uniform(
                 (tf.shape(x)[0], self.z_num), minval=-1.0, maxval=1.0)
+        self.jitter = tf.truncated_normal(
+                (self.batch_size, self.z_num), mean=0.0, stddev=0.1)
+        self.z_jitter = tf.clip_by_value(self.z + self.jitter, -1.0, 1.0)
+        self.z_jitter_ = tf.clip_by_value(self.z - self.jitter, -1.0, 1.0)
         self.z_ot = tf.placeholder(tf.float32, [None, self.z_num], name="z_ot")
         self.x_ot_reshaped = tf.placeholder(tf.float32, 
                 [None, self.vectorized_dim], name="x_ot")
@@ -156,63 +166,88 @@ class Trainer(object):
                 [self.batch_size, self.z_num], name='input2_enc')
         self.k_t = tf.Variable(0., trainable=False, name='k_t')
 
-        G, self.G_var = GeneratorCNN(
-                self.z, self.conv_hidden_num, self.channel,
-                self.repeat_num, self.data_format, reuse=False)
-        G_ot, self.G_ot_var = GeneratorCNN(
+        # Network outputs.
+        G_out, self.G_var = GeneratorCNN(
+                tf.concat([self.z, self.z_jitter, self.z_jitter_], 0),
+                self.conv_hidden_num, self.channel, self.repeat_num,
+                self.data_format, reuse=False)
+        G, G_jit, G_jit_ = tf.split(G_out, 3)
+        G_ot, _ = GeneratorCNN(
                 self.z_ot, self.conv_hidden_num, self.channel,
                 self.repeat_num, self.data_format, reuse=True)
 
-        d_out, D_z, self.D_var = DiscriminatorCNN(
+        d_out, d_enc, self.D_var = DiscriminatorCNN(
                 tf.concat([G, x], 0), self.channel, self.z_num, self.repeat_num,
                 self.conv_hidden_num, self.data_format, reuse=False)
         AE_G, AE_x = tf.split(d_out, 2)
-        D_G, self.D_z = tf.split(D_z, 2)
-
+        _, self.x_enc = tf.split(d_enc, 2)
         _, self.G_enc, _ = DiscriminatorCNN(
                 tf.concat([G_ot], 0), self.channel, self.z_num, self.repeat_num,
                 self.conv_hidden_num, self.data_format, reuse=True)
-        _, self.x_enc, _ = DiscriminatorCNN(
-                tf.concat([x], 0), self.channel, self.z_num, self.repeat_num,
-                self.conv_hidden_num, self.data_format, reuse=True)
 
+        # Rescaling/reshaping outputs.
         self.G = denorm_img(G, self.data_format)
         self.G_ot = denorm_img(G_ot, self.data_format)
+        self.G_jit = denorm_img(G_jit, self.data_format)
+        self.G_jit_ = denorm_img(G_jit_, self.data_format)
         self.AE_G = denorm_img(AE_G, self.data_format)
         self.AE_x = denorm_img(AE_x, self.data_format)
-
         self.G_ot_reshaped = tf.reshape(self.G_ot, [self.batch_size, -1])
 
+        # Set up optimizers, and their respective learning rates.
         if self.optimizer == 'adam':
             optimizer = tf.train.AdamOptimizer
         else:
             raise Exception("[!] Caution! Paper didn't use {} opimizer other than Adam".format(config.optimizer))
+        d_optimizer = optimizer(self.d_lr)
+        g_optimizer = optimizer(self.g_lr)
+        cvg_optimizer = optimizer(self.g_lr)
+        smo_optimizer = optimizer(0.00001)
+        vol_optimizer = optimizer(0.00001)
+        var_optimizer = optimizer(0.000005)
 
-        g_optimizer, d_optimizer = optimizer(self.g_lr), optimizer(self.d_lr)
+        # Define losses.
+        self.d_loss_real = tf.reduce_mean(tf.norm(AE_x - x))
+        self.d_loss_fake = tf.reduce_mean(tf.norm(AE_G - G))
 
-        # TODO: Figure out if d_losses should be on normed or unnormed.
-        self.d_loss_real = tf.reduce_mean(tf.abs(AE_x - x))
-        self.d_loss_fake = tf.reduce_mean(tf.abs(AE_G - G))
+        self.smoothness_loss = tf.reduce_mean(tf.norm(G - G_jit))
+        self.volume_loss = tf.reduce_mean(tf.norm(G_jit - 2 * G + G_jit_))
+
+        _, variance = tf.nn.moments(self.G_enc, axes=[1])
+        self.variance_loss = -1 * tf.reduce_mean(variance)
+
         self.coverage_loss_pixel = tf.reduce_mean(tf.norm(
-            self.G_ot_reshaped - self.x_ot_reshaped, axis=1))
+            self.G_ot_reshaped - self.x_ot_reshaped,
+            ord=self.coverage_norm_order, axis=1))
         self.coverage_loss_enc_manual = tf.reduce_mean(tf.norm(self.input1_enc -
-            self.input2_enc))
-        self.coverage_loss_enc = tf.reduce_mean(tf.norm(self.G_enc - self.x_enc))
-        self.scaled_coverage_loss = (1./10000. * self.coverage_loss_enc)
+            self.input2_enc, ord=self.coverage_norm_order))
+        self.coverage_loss_enc = tf.reduce_mean(tf.norm(self.G_enc - self.x_enc,
+            ord=self.coverage_norm_order))
         if self.coverage_space == 'pixel':
-            self.coverage_loss = self.coverage_loss_enc
+            self.coverage_loss = self.coverage_loss_pixel
         elif self.coverage_space == 'encoding':
             self.coverage_loss = self.coverage_loss_enc
         else:
             raise ValueError('self.coverage_space must be \'pixel\' or \'encoding\'')
 
+        self.ae_loss = self.d_loss_real
         self.d_loss = self.d_loss_real - self.k_t * self.d_loss_fake
-        self.g_loss = self.d_loss_fake + self.scaled_coverage_loss
-        #NOTE: Original
-        #self.g_loss = self.d_loss_fake
+        self.g_loss = self.d_loss_fake
+        self.cvg_loss = self.coverage_loss
+        self.smo_loss = self.smoothness_loss
+        self.vol_loss = self.volume_loss
+        self.var_loss = self.variance_loss
 
-        self.d_optim = d_optimizer.minimize(self.d_loss, var_list=self.D_var)
-        self.g_optim = g_optimizer.minimize(self.g_loss, global_step=self.step, var_list=self.G_var)
+        # Define optimization nodes.
+        self.ae_optim = d_optimizer.minimize(self.ae_loss, var_list=self.D_var,
+                global_step=self.step)
+        self.d_optim = d_optimizer.minimize(self.d_loss, var_list=self.D_var,
+                global_step=self.step)
+        self.g_optim = g_optimizer.minimize(self.g_loss, var_list=self.G_var)
+        self.cvg_optim = cvg_optimizer.minimize(self.cvg_loss, var_list=self.G_var)
+        self.smo_optim = smo_optimizer.minimize(self.smo_loss, var_list=self.G_var)
+        self.vol_optim = vol_optimizer.minimize(self.vol_loss, var_list=self.G_var)
+        self.var_optim = var_optimizer.minimize(self.var_loss, var_list=self.G_var)
 
         self.balance = self.gamma * self.d_loss_real - self.g_loss
         self.measure = self.d_loss_real + tf.abs(self.balance)
@@ -223,15 +258,17 @@ class Trainer(object):
 
         self.summary_op = tf.summary.merge([
             tf.summary.image("G", self.G),
-            tf.summary.image("AE_G", self.AE_G),
             tf.summary.image("AE_x", self.AE_x),
+            tf.summary.image("x", denorm_img(x, self.data_format)),
 
             tf.summary.scalar("loss/d_loss", self.d_loss),
             tf.summary.scalar("loss/d_loss_real", self.d_loss_real),
             tf.summary.scalar("loss/d_loss_fake", self.d_loss_fake),
             tf.summary.scalar("loss/g_loss", self.g_loss),
-            tf.summary.scalar("loss/scaled_coverage_loss", self.scaled_coverage_loss),
             tf.summary.scalar("loss/coverage_loss", self.coverage_loss),
+            tf.summary.scalar("loss/smoothness_loss", self.smoothness_loss),
+            tf.summary.scalar("loss/volume_loss", self.volume_loss),
+            tf.summary.scalar("loss/variance_loss", self.variance_loss),
             tf.summary.scalar("misc/measure", self.measure),
             tf.summary.scalar("misc/k_t", self.k_t),
             tf.summary.scalar("misc/d_lr", self.d_lr),
@@ -246,65 +283,114 @@ class Trainer(object):
         save_image(x_fixed, '{}/x_fixed.png'.format(self.model_dir))
         prev_measure = 1
         measure_history = deque([0]*self.lr_update_step, self.lr_update_step)
+        print('Coverage norm order: {}'.format(self.coverage_norm_order))
 
-        for step in trange(self.start_step, self.max_step):
-            # Compute a nearest neighbor set of G's and X's.
+        # Pretrain autoencoder.
+        if self.train_ae:
+            ae_steps = 5000
             z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
-            x = self.get_image_from_loader()
-            x_ot = self.reorder_x(z_ot, x, dist=self.coverage_space, method='greedy')
+            fetch_dict_ae_logs = {
+                'summary': self.summary_op,
+                'd_loss_real': self.d_loss_real,
+                'coverage_loss': self.coverage_loss,
+                'smoothness_loss': self.smoothness_loss,
+                'volume_loss': self.volume_loss,
+                'variance_loss': self.variance_loss}
+            print('Pretraining autoencoder with {} steps.'.format(ae_steps))
+            for ae_step in xrange(ae_steps):
+                self.sess.run(self.ae_optim)
+                if ae_step % self.log_step == 0:
+                    result = self.sess.run(fetch_dict_ae_logs,
+                        {self.z_ot: z_ot})
+                    self.summary_writer.add_summary(result['summary'], ae_step)
+                    self.summary_writer.flush()
 
-            fetch_dict = {
-                "k_update": self.k_update,
-                "measure": self.measure,
-            }
+                    d_loss_real = result['d_loss_real']
+                    coverage_loss = result['coverage_loss']
+                    smoothness_loss = result['smoothness_loss']
+                    volume_loss = result['volume_loss']
+                    variance_loss = result['variance_loss']
 
-            if step % self.log_step == 0:
-                fetch_dict.update({
-                    "summary": self.summary_op,
-                    "scaled_coverage_loss": self.scaled_coverage_loss,
-                    "coverage_loss": self.coverage_loss,
-                    "g_loss": self.g_loss,
-                    "d_loss": self.d_loss,
-                    "k_t": self.k_t,
-                })
+                    print('"[{}/{}] d_loss_real: {:.4f} coverage: {:.4f} smooth: {:.4f} volume: {:.4f} variance: {:.4f}'. \
+                        format(ae_step, ae_steps, d_loss_real, coverage_loss,
+                            smoothness_loss, volume_loss, variance_loss))
 
-            result = self.sess.run(fetch_dict,
-                feed_dict={
-                    self.z_ot: z_ot,
-                    self.x: to_nchw_numpy(x_ot)})
+        # Train full GAN.
+        if self.train_gan:
+            print('Training GAN with {} steps.'.format(
+                self.max_step - self.start_step))
+            for step in trange(self.start_step, self.max_step):
+                # Compute a nearest neighbor set of G's and X's.
+                z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
+                x = self.get_image_from_loader()
+                #x_ot = self.reorder_x(z_ot, x, dist=self.coverage_space,
+                #    method='greedy')
+                x_ot = x
+                x_ot_reshaped = np.reshape(x_ot, [self.batch_size, -1])
 
-            measure = result['measure']
-            measure_history.append(measure)
+                fetch_dict = {
+                    'k_update': self.k_update,
+                    #'cvg_optim': self.cvg_optim,
+                    #'smo_optim': self.smo_optim,
+                    #'vol_optim': self.vol_optim,
+                    'var_optim': self.var_optim,
+                }
 
-            if step % self.log_step == 0:
-                self.summary_writer.add_summary(result['summary'], step)
-                self.summary_writer.flush()
+                if step % self.log_step == 0:
+                    fetch_dict.update({
+                        'summary': self.summary_op,
+                        'coverage_loss': self.coverage_loss,
+                        'smoothness_loss': self.smoothness_loss,
+                        'volume_loss': self.volume_loss,
+                        'variance_loss': self.variance_loss,
+                        'd_loss_real': self.d_loss_real,
+                        'd_loss_fake': self.d_loss_fake,
+                        'k_t': self.k_t,
+                    })
 
-                scaled_coverage_loss = result['scaled_coverage_loss']
-                coverage_loss = result['coverage_loss']
-                g_loss = result['g_loss']
-                d_loss = result['d_loss']
-                k_t = result['k_t']
-
-                print("[{}/{}] Loss_D: {:.4f} Loss_G: {:.4f} Loss_scvg,cvg: {:.4f},{:.4f} measure: {:.4f}, k_t: {:.4f}". \
-                    format(step, self.max_step, d_loss, g_loss,
-                        scaled_coverage_loss, coverage_loss, measure, k_t))
-
-            if step % (self.log_step * 10) == 0:
-                x_fake = self.generate(z_fixed, self.model_dir, idx=step)
-                self.autoencode(x_fixed, self.model_dir, idx=step, x_fake=x_fake)
-
-                # Save diagnostics.
-                self.diagnostic()
-
-            if step % self.lr_update_step == self.lr_update_step - 1:
-                self.sess.run([self.g_lr_update, self.d_lr_update])
-                #cur_measure = np.mean(measure_history)
-                #if cur_measure > prev_measure * 0.99:
-                #prev_measure = cur_measure
+                if self.coverage_space == 'encoding':
+                    result = self.sess.run(fetch_dict,
+                        feed_dict={
+                            self.z_ot: z_ot,
+                            self.x: to_nchw_numpy(x_ot)})
+                elif self.coverage_space == 'pixel':
+                    result = self.sess.run(fetch_dict,
+                        feed_dict={
+                            self.z_ot: z_ot,
+                            self.x_ot_reshaped: x_ot_reshaped})
+                else:
+                    raise ValueError('self.coverage_space must be \'encoding\' or \'pixel\'')
 
 
-    def diagnostic(self):
+                if step % self.log_step == 0:
+                    self.summary_writer.add_summary(result['summary'], step)
+                    self.summary_writer.flush()
+
+                    coverage_loss = result['coverage_loss']
+                    smoothness_loss = result['smoothness_loss']
+                    volume_loss = result['volume_loss']
+                    variance_loss = result['variance_loss']
+                    d_loss_real = result['d_loss_real']
+                    d_loss_fake = result['d_loss_fake']
+                    k_t = result['k_t']
+
+                    print('[{}/{}] d_loss_real/fake: {:.4f}/{:.4f} Loss_cvg: {:.4f} Smooth: {:.4f}, Volume: {:.4f}, Variance: {:.4f}, k_t: {:.4f}'. \
+                        format(step, self.max_step, d_loss_real, d_loss_fake,
+                            coverage_loss, smoothness_loss, volume_loss,
+                            variance_loss, k_t))
+
+                if step % (self.log_step * 10) == 0:
+                    x_fake = self.generate(z_fixed, self.model_dir, idx=step)
+                    self.autoencode(x_fixed, self.model_dir, idx=step, x_fake=x_fake)
+
+                    # Save diagnostics.
+                    self.diagnostic(step)
+
+                if step % self.lr_update_step == self.lr_update_step - 1:
+                    self.sess.run([self.g_lr_update, self.d_lr_update])
+
+
+    def diagnostic(self, step):
         g_optim_num = 1
 
         # Save current checkpoint.
@@ -317,8 +403,8 @@ class Trainer(object):
         G = self.sess.run(self.G_ot, {self.z_ot: z})
         G_enc = self.encode(G)
         x_enc = self.encode(x)
-        AE_G = self.autoencode(G, self.model_dir)
-        AE_x = self.autoencode(x, self.model_dir)
+        AE_G = self.autoencode(G, self.model_dir, save=False)
+        AE_x = self.autoencode(x, self.model_dir, save=False)
         distances = cdist(G_enc, x_enc)
         x_ot = self.optimal_transport(distances, x, method='greedy') 
 
@@ -330,30 +416,37 @@ class Trainer(object):
         G_ = self.sess.run(self.G_ot, {self.z_ot: z})
         G_enc_ = self.encode(G)
         x_enc_ = self.encode(x)
-        AE_G_ = self.autoencode(G, self.model_dir)
-        AE_x_ = self.autoencode(x, self.model_dir)
+        AE_G_ = self.autoencode(G, self.model_dir, save=False)
+        AE_x_ = self.autoencode(x, self.model_dir, save=False)
         
         # Restore original.
         #self.saver.restore(self.sess, os.path.join(self.load_path,
         #    ckpt_name))
 
-        big_img = np.stack([x, G, G_], 0).transpose([0,2,1,3,4]).reshape([self.input_scale_size * 3,
-            self.input_scale_size * self.batch_size, 3])
+        # Save summary image.
+        big_img = np.stack([x, G, G_], 0).transpose([0,2,1,3,4]).reshape(
+            [self.input_scale_size * 3,
+             self.input_scale_size * self.batch_size,
+             3])
         big_img = np.rint(big_img).astype(np.uint8)
         im = Image.fromarray(big_img)
-        im.save(os.path.join(self.model_dir, 'big_img_{}.png'.format(self.sess.run(self.step))))
+        save_path = os.path.join(self.model_dir, 
+                'big_img_{}.png'.format(step))
+        im.save(save_path)
+        print('Saved {}'.format(save_path))
 
 
     def build_test_model(self):
         with tf.variable_scope("test") as vs:
             # Extra ops for interpolation
             z_optimizer = tf.train.AdamOptimizer(0.0001)
-            self.z_r = tf.get_variable("z_r", [self.batch_size, self.z_num], tf.float32)
+            self.z_r = tf.get_variable("z_r", [self.batch_size, self.z_num],
+                tf.float32)
             self.z_r_update = tf.assign(self.z_r, self.z)
 
         G_z_r, _ = GeneratorCNN(
-                self.z_r, self.conv_hidden_num, self.channel,
-                self.repeat_num, self.data_format, reuse=True)
+            self.z_r, self.conv_hidden_num, self.channel,
+            self.repeat_num, self.data_format, reuse=True)
 
         # Optimize z so that G(z) matches X. Give z_r as preimage of x.
         with tf.variable_scope("test") as vs:
@@ -373,7 +466,7 @@ class Trainer(object):
         return x
 
 
-    def autoencode(self, inputs, path, idx=None, x_fake=None):
+    def autoencode(self, inputs, path, idx=None, x_fake=None, save=True):
         items = {
             'real': inputs,
             'fake': x_fake,
@@ -386,20 +479,21 @@ class Trainer(object):
 
             x_path = os.path.join(path, '{}_D_{}.png'.format(idx, key))
             x = self.sess.run(self.AE_x, {self.x: img})
-            save_image(x, x_path)
-            print("[*] Samples saved: {}".format(x_path))
+            if save:
+                save_image(x, x_path)
+                print("[*] Samples saved: {}".format(x_path))
         return x
 
 
     def encode(self, inputs):
         if inputs.shape[3] in [1, 3]:
             inputs = inputs.transpose([0, 3, 1, 2])
-        return self.sess.run(self.D_z, {self.x: inputs})
+        return self.sess.run(self.x_enc, {self.x: inputs})
 
 
     def decode(self, z):
-        # NOTE: This may be wrong. self.D_z is not an ancestor of self.AE_x.
-        return self.sess.run(self.AE_x, {self.D_z: z})
+        # NOTE: This may be wrong. self.x_enc is not an ancestor of self.AE_x.
+        return self.sess.run(self.AE_x, {self.x_enc: z})
 
 
     def interpolate_G(self, real_batch, step=0, root_path='.', train_epoch=0):
@@ -440,7 +534,7 @@ class Trainer(object):
         decodes = []
         for idx, ratio in enumerate(np.linspace(0, 1, 10)):
             z = np.stack([slerp(ratio, r1, r2) for r1, r2 in zip(real1_encode, real2_encode)])
-            # NOTE: This may be wrong. self.D_z is not an ancestor of self.AE_x.
+            # NOTE: This may be wrong. self.x_enc is not an ancestor of self.AE_x.
             z_decode = self.decode(z)
             decodes.append(z_decode)
 
