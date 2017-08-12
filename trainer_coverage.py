@@ -28,6 +28,8 @@ class Trainer(object):
         self.dataset = config.dataset
         self.data_path = config.data_path
         self.split = config.split
+        self.coverage_diagnostics = config.coverage_diagnostics
+        self.coverage_space = config.coverage_space
         self.coverage_norm_order = config.coverage_norm_order
         self.train_ae = config.train_ae
         self.train_gan = config.train_gan
@@ -101,6 +103,16 @@ class Trainer(object):
             if could_load:
                 self.max_step = self.step + (self.max_step - self.start_step)
                 self.start_step = self.step
+        elif not self.is_train:
+            # dirty way to bypass graph finilization error
+            g = tf.get_default_graph()
+            g._finalized = False
+            self.build_test_model()
+            could_load = self.load_checkpoints()
+
+        # Run diagnostic of coverage loss on real data.
+        if self.coverage_diagnostics:
+            self.coverage_loss_on_real_data()
 
 
     def load_checkpoints(self):
@@ -146,9 +158,8 @@ class Trainer(object):
         self.z_jitter = tf.clip_by_value(self.z + self.jitter, -1.0, 1.0)
         self.z_jitter_ = tf.clip_by_value(self.z - self.jitter, -1.0, 1.0)
         self.z_ot = tf.placeholder(tf.float32, [None, self.z_num], name="z_ot")
-        self.x_fixed = tf.placeholder(tf.float32, [self.batch_size,
-            self.input_scale_size, self.input_scale_size, self.channel], 
-            name="x_fixed")
+        self.x_ot_reshaped = tf.placeholder(tf.float32, 
+                [None, self.vectorized_dim], name="x_ot")
         self.input1_enc = tf.placeholder(tf.float32,
                 [self.batch_size, self.z_num], name='input1_enc')
         self.input2_enc = tf.placeholder(tf.float32,
@@ -205,11 +216,19 @@ class Trainer(object):
         _, variance = tf.nn.moments(self.G_enc, axes=[1])
         self.variance_loss = -1 * tf.reduce_mean(variance)
 
+        self.coverage_loss_pixel = tf.reduce_mean(tf.norm(
+            self.G_ot_reshaped - self.x_ot_reshaped,
+            ord=self.coverage_norm_order, axis=1))
         self.coverage_loss_enc_manual = tf.reduce_mean(tf.norm(self.input1_enc -
             self.input2_enc, ord=self.coverage_norm_order))
         self.coverage_loss_enc = tf.reduce_mean(tf.norm(self.G_enc - self.x_enc,
             ord=self.coverage_norm_order))
-        self.coverage_loss = self.coverage_loss_enc
+        if self.coverage_space == 'pixel':
+            self.coverage_loss = self.coverage_loss_pixel
+        elif self.coverage_space == 'encoding':
+            self.coverage_loss = self.coverage_loss_enc
+        else:
+            raise ValueError('self.coverage_space must be \'pixel\' or \'encoding\'')
 
         self.ae_loss = self.d_loss_real
         self.d_loss = self.d_loss_real - self.k_t * self.d_loss_fake
@@ -237,21 +256,6 @@ class Trainer(object):
             self.k_update = tf.assign(
                 self.k_t, tf.clip_by_value(self.k_t + self.lambda_k * self.balance, 0, 1))
 
-        # Add nodes that are specific to finding preimage z's.
-        # Then, optimize z so that G(z) matches X, i.e. z_r is preimage of x.
-        with tf.variable_scope('z') as vs:
-            z_optimizer = tf.train.AdamOptimizer(0.0001)
-            self.z_r = tf.get_variable('z_r', [self.batch_size, self.z_num],
-                tf.float32, tf.random_uniform_initializer(-1, 1))
-            #self.z_r_update = tf.assign(self.z_r, self.z)
-        G_z_r, _ = GeneratorCNN(
-            self.z_r, self.conv_hidden_num, self.channel,
-            self.repeat_num, self.data_format, reuse=True)
-        self.G_z_r = denorm_img(G_z_r, self.data_format)
-        with tf.variable_scope('z') as vs:
-            self.z_r_loss = tf.reduce_mean(tf.abs(self.x_fixed - self.G_z_r))
-            self.z_r_optim = z_optimizer.minimize(self.z_r_loss, var_list=[self.z_r])
-
         self.summary_op = tf.summary.merge([
             tf.summary.image("G", self.G),
             tf.summary.image("AE_x", self.AE_x),
@@ -265,7 +269,6 @@ class Trainer(object):
             tf.summary.scalar("loss/smoothness_loss", self.smoothness_loss),
             tf.summary.scalar("loss/volume_loss", self.volume_loss),
             tf.summary.scalar("loss/variance_loss", self.variance_loss),
-            tf.summary.scalar("loss/z_r_loss", self.z_r_loss),
             tf.summary.scalar("misc/measure", self.measure),
             tf.summary.scalar("misc/k_t", self.k_t),
             tf.summary.scalar("misc/d_lr", self.d_lr),
@@ -316,25 +319,26 @@ class Trainer(object):
         if self.train_gan:
             print('Training GAN with {} steps.'.format(
                 self.max_step - self.start_step))
-            mark_gan, mark_z = 50000, 250000
             for step in trange(self.start_step, self.max_step):
                 # Compute a nearest neighbor set of G's and X's.
                 z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
                 x = self.get_image_from_loader()
-                #x_ot = self.reorder_x(z_ot, x, method='greedy')
-                x_ot = x
+                x_ot = self.reorder_x(z_ot, x, dist=self.coverage_space,
+                    method='greedy')
+                #x_ot = x
+                x_ot_reshaped = np.reshape(x_ot, [self.batch_size, -1])
 
-                if step < mark_gan:
+                if step % 5 == 0:
                     fetch_dict = {
                         'k_update': self.k_update,
-                    }
-                elif step >= mark_gan and step < mark_z:
-                    fetch_dict = {
-                        'z_r_optim': self.z_r_optim,
+                        'cvg_optim': self.cvg_optim,
+                        #'smo_optim': self.smo_optim,
+                        #'vol_optim': self.vol_optim,
+                        #'var_optim': self.var_optim,
                     }
                 else:
                     fetch_dict = {
-                        'vol_optim': self.vol_optim,
+                        'k_update': self.k_update
                     }
 
                 if step % self.log_step == 0:
@@ -346,15 +350,22 @@ class Trainer(object):
                         'variance_loss': self.variance_loss,
                         'd_loss_real': self.d_loss_real,
                         'd_loss_fake': self.d_loss_fake,
-                        'z_r_loss': self.z_r_loss,
                         'k_t': self.k_t,
                     })
 
-                result = self.sess.run(fetch_dict,
-                    feed_dict={
-                        self.z_ot: z_ot,
-                        self.x: to_nchw_numpy(x_ot),
-                        self.x_fixed: x_fixed})
+                if self.coverage_space == 'encoding':
+                    result = self.sess.run(fetch_dict,
+                        feed_dict={
+                            self.z_ot: z_ot,
+                            self.x: to_nchw_numpy(x_ot)})
+                elif self.coverage_space == 'pixel':
+                    result = self.sess.run(fetch_dict,
+                        feed_dict={
+                            self.z_ot: z_ot,
+                            self.x_ot_reshaped: x_ot_reshaped})
+                else:
+                    raise ValueError('self.coverage_space must be \'encoding\' or \'pixel\'')
+
 
                 if step % self.log_step == 0:
                     self.summary_writer.add_summary(result['summary'], step)
@@ -366,32 +377,61 @@ class Trainer(object):
                     variance_loss = result['variance_loss']
                     d_loss_real = result['d_loss_real']
                     d_loss_fake = result['d_loss_fake']
-                    z_r_loss = result['z_r_loss']
                     k_t = result['k_t']
 
-                    print('[{}/{}] d_loss_real/fake: {:.4f}/{:.4f} Loss_cvg: {:.4f} Smooth: {:.4f}, Volume: {:.4f}, Variance: {:.4f}, k_t: {:.4f}, z_r_loss: {:.4f}'. \
+                    print('[{}/{}] d_loss_real/fake: {:.4f}/{:.4f} Loss_cvg: {:.4f} Smooth: {:.4f}, Volume: {:.4f}, Variance: {:.4f}, k_t: {:.4f}'. \
                         format(step, self.max_step, d_loss_real, d_loss_fake,
                             coverage_loss, smoothness_loss, volume_loss,
-                            variance_loss, k_t, z_r_loss))
+                            variance_loss, k_t))
 
-                if step % (self.log_step * 10) == 0:
+                #if step % (self.log_step * 10) == 0:
+                if 0:
                     x_fake = self.generate(z_fixed, self.model_dir, idx=step)
                     self.autoencode(x_fixed, self.model_dir, idx=step, x_fake=x_fake)
 
                     # Save diagnostics.
-                    self.diagnostic(step, x_fixed)
+                    self.diagnostic(step)
 
                 if step % self.lr_update_step == self.lr_update_step - 1:
                     self.sess.run([self.g_lr_update, self.d_lr_update])
 
 
-    def diagnostic(self, step, x_fixed):
-        z = self.sess.run(self.z_r)
+    def diagnostic(self, step):
+        g_optim_num = 1
+
+        # Save current checkpoint.
+        #ckpt = tf.train.get_checkpoint_state(self.model_dir)
+        #ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+
+        # Do stuff.
+        z = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
+        x = self.get_image_from_loader()
         G = self.sess.run(self.G_ot, {self.z_ot: z})
+        G_enc = self.encode(G)
+        x_enc = self.encode(x)
+        AE_G = self.autoencode(G, self.model_dir, save=False)
+        AE_x = self.autoencode(x, self.model_dir, save=False)
+        distances = cdist(G_enc, x_enc)
+        x_ot = self.optimal_transport(distances, x, method='greedy') 
+
+        for _ in range(g_optim_num):
+            self.sess.run(self.g_optim, feed_dict={
+                self.z_ot: z,
+                self.x: to_nchw_numpy(x_ot)})
+
+        G_ = self.sess.run(self.G_ot, {self.z_ot: z})
+        G_enc_ = self.encode(G)
+        x_enc_ = self.encode(x)
+        AE_G_ = self.autoencode(G, self.model_dir, save=False)
+        AE_x_ = self.autoencode(x, self.model_dir, save=False)
         
+        # Restore original.
+        #self.saver.restore(self.sess, os.path.join(self.load_path,
+        #    ckpt_name))
+
         # Save summary image.
-        big_img = np.stack([x_fixed, G], 0).transpose([0,2,1,3,4]).reshape(
-            [self.input_scale_size * 2,
+        big_img = np.stack([x, G, G_], 0).transpose([0,2,1,3,4]).reshape(
+            [self.input_scale_size * 3,
              self.input_scale_size * self.batch_size,
              3])
         big_img = np.rint(big_img).astype(np.uint8)
@@ -400,6 +440,27 @@ class Trainer(object):
                 'big_img_{}.png'.format(step))
         im.save(save_path)
         print('Saved {}'.format(save_path))
+
+
+    def build_test_model(self):
+        with tf.variable_scope("test") as vs:
+            # Extra ops for interpolation
+            z_optimizer = tf.train.AdamOptimizer(0.0001)
+            self.z_r = tf.get_variable("z_r", [self.batch_size, self.z_num],
+                tf.float32)
+            self.z_r_update = tf.assign(self.z_r, self.z)
+
+        G_z_r, _ = GeneratorCNN(
+            self.z_r, self.conv_hidden_num, self.channel,
+            self.repeat_num, self.data_format, reuse=True)
+
+        # Optimize z so that G(z) matches X. Give z_r as preimage of x.
+        with tf.variable_scope("test") as vs:
+            self.z_r_loss = tf.reduce_mean(tf.abs(self.x - G_z_r))
+            self.z_r_optim = z_optimizer.minimize(self.z_r_loss, var_list=[self.z_r])
+
+        test_variables = tf.contrib.framework.get_variables(vs)
+        self.sess.run(tf.variables_initializer(test_variables))
 
 
     def generate(self, inputs, root_path=None, path=None, idx=None, save=True):
@@ -422,7 +483,7 @@ class Trainer(object):
             if img.shape[3] in [1, 3]:
                 img = img.transpose([0, 3, 1, 2])
 
-            x_path = os.path.join(path, 'AE_{}_{}.png'.format(key, idx))
+            x_path = os.path.join(path, '{}_D_{}.png'.format(idx, key))
             x = self.sess.run(self.AE_x, {self.x: img})
             if save:
                 save_image(x, x_path)
@@ -463,9 +524,29 @@ class Trainer(object):
             generated.append(z_decode)
         generated = np.stack(generated).transpose([1, 0, 2, 3, 4])
 
+        #for idx, img in enumerate(generated):
+        #    save_image(img, os.path.join(root_path, 'test{}_interp_G_{}.png'.format(step, idx)), nrow=10)
+
         all_img_num = np.prod(generated.shape[:2])
         batch_generated = np.reshape(generated, [all_img_num] + list(generated.shape[2:]))
         save_image(batch_generated, os.path.join(root_path, 'test{}_interp_G.png'.format(step)), nrow=10)
+
+
+    def interpolate_D(self, real1_batch, real2_batch, step=0, root_path="."):
+        real1_encode = self.encode(real1_batch)
+        real2_encode = self.encode(real2_batch)
+
+        decodes = []
+        for idx, ratio in enumerate(np.linspace(0, 1, 10)):
+            z = np.stack([slerp(ratio, r1, r2) for r1, r2 in zip(real1_encode, real2_encode)])
+            # NOTE: This may be wrong. self.x_enc is not an ancestor of self.AE_x.
+            z_decode = self.decode(z)
+            decodes.append(z_decode)
+
+        decodes = np.stack(decodes).transpose([1, 0, 2, 3, 4])
+        for idx, img in enumerate(decodes):
+            img = np.concatenate([[real1_batch[idx]], img, [real2_batch[idx]]], 0)
+            save_image(img, os.path.join(root_path, 'test{}_interp_D_{}.png'.format(step, idx)), nrow=10 + 2)
 
 
     def test(self):
@@ -490,6 +571,7 @@ class Trainer(object):
             #    real2_batch, root_path, idx="test{}_real2".format(step))
 
             self.interpolate_G(real1_batch, step, root_path, train_epoch=100)
+            #self.interpolate_D(real1_batch, real2_batch, step, root_path)
 
             z_fixed = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
             G_z = self.generate(z_fixed, root_path=root_path, 
@@ -508,6 +590,149 @@ class Trainer(object):
         if self.data_format == 'NCHW':
             x = x.transpose([0, 2, 3, 1])
         return x
+
+
+    def coverage_loss_on_real_data(self):
+        if not self.load_path:
+            raise ValueError(('[!] This test requires a load_path to fetch an '
+                'existing encoder. None found.'))
+
+        from numpy import linalg as LA
+        num_runs = 20
+
+        print("[*] real-real cvg losses...")
+        rr_greedy = []
+        rr_munkres = []
+        for _ in range(num_runs):
+            x1 = self.get_image_from_loader()
+            x2 = self.get_image_from_loader()
+            x1r = np.reshape(x1, [self.batch_size, -1])
+            x2r = np.reshape(x2, [self.batch_size, -1])
+            distances = cdist(x1r, x2r)
+
+            x2r_ot_g = self.optimal_transport(distances, x2r, method='greedy') 
+            rr_greedy_ = np.mean(LA.norm(x1r - x2r_ot_g, axis=1))
+            rr_greedy.append(rr_greedy_)
+            
+            x2r_ot_m = self.optimal_transport(distances, x2r, method='munkres') 
+            rr_munkres_ = np.mean(LA.norm(x1r - x2r_ot_m, axis=1))
+            rr_munkres.append(rr_munkres_)
+
+        print("[*] gen-real cvg losses...")
+        gr_greedy = []
+        gr_munkres = []
+        for _ in range(num_runs):
+            z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
+            G_ot = self.sess.run(self.G_ot, {self.z_ot: z_ot})
+            x = self.get_image_from_loader()
+            G_ot_r = np.reshape(G_ot, [self.batch_size, -1])
+            x_r = np.reshape(x, [self.batch_size, -1])
+            distances = cdist(G_ot_r, x_r)
+
+            x_ot_r_g = self.optimal_transport(distances, x_r, method='greedy') 
+            gr_greedy_ = self.sess.run(self.coverage_loss_pixel,
+                feed_dict={
+                    self.G_ot_reshaped: G_ot_r,
+                    self.x_ot_reshaped: x_ot_r_g})
+            gr_greedy.append(gr_greedy_)
+
+            x_ot_r_m = self.optimal_transport(distances, x_r, method='munkres') 
+            gr_munkres_ = self.sess.run(self.coverage_loss_pixel,
+                feed_dict={
+                    self.G_ot_reshaped: G_ot_r,
+                    self.x_ot_reshaped: x_ot_r_m})
+            gr_munkres.append(gr_munkres_)
+
+        print("[*] encoded real-real cvg losses...")
+        enc_rr_greedy = []
+        enc_rr_munkres = []
+        for _ in range(num_runs):
+            x1 = self.get_image_from_loader()
+            x2 = self.get_image_from_loader()
+            x1_enc = self.encode(x1)
+            x2_enc = self.encode(x2)
+            distances = cdist(x1_enc, x2_enc)
+
+            x2_enc_ot_g = self.optimal_transport(distances, x2_enc, method='greedy') 
+            enc_rr_greedy_ = np.mean(LA.norm(x1_enc - x2_enc_ot_g, axis=1))
+            enc_rr_greedy.append(enc_rr_greedy_)
+
+            x2_enc_ot_m = self.optimal_transport(distances, x2_enc, method='munkres') 
+            enc_rr_munkres_ = np.mean(LA.norm(x1_enc - x2_enc_ot_m, axis=1))
+            enc_rr_munkres.append(enc_rr_munkres_)
+
+        print("[*] encoded gen-real cvg losses...")
+        enc_gr_greedy = []
+        enc_gr_munkres = []
+        for _ in range(num_runs):
+            z_ot = np.random.uniform(-1, 1, size=(self.batch_size, self.z_num))
+            G_ot = self.sess.run(self.G_ot, {self.z_ot: z_ot})
+            x = self.get_image_from_loader()
+            G_enc = self.encode(G_ot)
+            x_enc = self.encode(x)
+            distances = cdist(G_enc, x_enc)
+
+            x_enc_ot_g = self.optimal_transport(distances, x_enc, method='greedy') 
+            enc_gr_greedy_ = self.sess.run(self.coverage_loss_enc_manual,
+                feed_dict={
+                    self.input1_enc: G_enc,
+                    self.input2_enc: x_enc_ot_g})
+            enc_gr_greedy.append(enc_gr_greedy_)
+
+            x_enc_ot_m = self.optimal_transport(distances, x_enc, method='munkres') 
+            enc_gr_munkres_ = self.sess.run(self.coverage_loss_enc_manual,
+                feed_dict={
+                    self.input1_enc: G_enc,
+                    self.input2_enc: x_enc_ot_m})
+            enc_gr_munkres.append(enc_gr_munkres_)
+
+
+
+        with open("coverage_loss_diagnostics.txt", "a") as f:
+            f.write("\nrr greedy. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(rr_greedy), np.median(rr_greedy), np.mean(rr_greedy),
+                np.max(rr_greedy), np.var(rr_greedy)))
+            f.write("\nrr munkres. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(rr_munkres), np.median(rr_munkres), np.mean(rr_munkres),
+                np.max(rr_munkres), np.var(rr_munkres)))
+            f.write("\ngr greedy. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(gr_greedy), np.median(gr_greedy), np.mean(gr_greedy),
+                np.max(gr_greedy), np.var(gr_greedy)))
+            f.write("\ngr munkres. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(gr_munkres), np.median(gr_munkres), np.mean(gr_munkres),
+                np.max(gr_munkres), np.var(gr_munkres)))
+            f.write("\nenc rr greedy. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(enc_rr_greedy), np.median(enc_rr_greedy), np.mean(enc_rr_greedy),
+                np.max(enc_rr_greedy), np.var(enc_rr_greedy)))
+            f.write("\nenc rr munkres. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(enc_rr_munkres), np.median(enc_rr_munkres), np.mean(enc_rr_munkres),
+                np.max(enc_rr_munkres), np.var(enc_rr_munkres)))
+            f.write("\nenc gr greedy. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(enc_gr_greedy), np.median(enc_gr_greedy), np.mean(enc_gr_greedy),
+                np.max(enc_gr_greedy), np.var(enc_gr_greedy)))
+            f.write("\nenc gr munkres. (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+                np.min(enc_gr_munkres), np.median(enc_gr_munkres), np.mean(enc_gr_munkres),
+                np.max(enc_gr_munkres), np.var(enc_gr_munkres)))
+
+        sys.exit('ended coverage loss comparison')
+
+
+        print("Sample size: {}, 20 runs".format(self.batch_size))
+        print("real-real cvg (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+            np.min(rr_greedy), np.median(rr_greedy), np.mean(rr_greedy),
+            np.max(rr_greedy), np.var(rr_greedy)))
+        print("real-gen cvg (min, med, mean,  / max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+            np.min(gr_cvg_losses), np.median(gr_cvg_losses), np.mean(gr_cvg_losses),
+            np.max(gr_cvg_losses), np.var(gr_cvg_losses)))
+        print('\n')
+        print("encoded real-real cvg (min, med, mean, max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+            np.min(enc_rr_cvg_losses), np.median(enc_rr_cvg_losses), np.mean(enc_rr_cvg_losses),
+            np.max(enc_rr_cvg_losses), np.var(enc_rr_cvg_losses)))
+        print("encoded gen-real cvg (min, med, mean,  / max, var): {:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(
+            np.min(enc_gr_cvg_losses), np.median(enc_gr_cvg_losses), np.mean(enc_gr_cvg_losses),
+            np.max(enc_gr_cvg_losses), np.var(enc_gr_cvg_losses)))
+        print("\n")
+        sys.exit('ended coverage loss comparison')
 
 
     def optimal_transport(self, distances, x, method='greedy'):
@@ -549,18 +774,25 @@ class Trainer(object):
         return x_ot
 
 
-    def reorder_x(self, z_ot, x, method='greedy'):
+    def reorder_x(self, z_ot, x, dist='encoding', method='greedy'):
         # 1. Get Generations (or their encodings) for a fixed set of z's.
         # 2. Get a sample (or their encodings) of real data.
         # 3. Vectorize images if needed, for distance calculation.
         # 4. Calculate pair-wise distance matrix, using Euclidean norm.
         # NOTE: Argument x is the full image sample.
         G = self.sess.run(self.G_ot, {self.z_ot: z_ot})
-        G_enc = self.encode(G) 
-        x_enc = self.encode(x) 
-        distances = cdist(G_enc, x_enc)
-        x_ot = self.optimal_transport(distances, x, method)
-        return x_ot
+        if dist == 'pixel':
+            G_r = np.reshape(G, [self.batch_size, -1])
+            x_r = np.reshape(x, [self.batch_size, -1])
+            distances = cdist(G_r, x_r)
+            x_ot = self.optimal_transport(distances, x, method)
+            return x_ot
+        elif dist == 'encoding':
+            G_enc = self.encode(G) 
+            x_enc = self.encode(x) 
+            distances = cdist(G_enc, x_enc)
+            x_ot = self.optimal_transport(distances, x, method)
+            return x_ot
 
 
 def next(loader):

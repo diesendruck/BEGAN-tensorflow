@@ -58,7 +58,6 @@ misc_arg.add_argument('--sample_per_image', type=int, default=64,
                       help='# of sample per image during test sample generation')
 misc_arg.add_argument('--random_seed', type=int, default=123)
 misc_arg.add_argument('--coverage_diagnostics', type=str2bool, default=False)
-misc_arg.add_argument('--coverage_space', type=str, default='encoding', choices=['encoding', 'pixel'])
 misc_arg.add_argument('--coverage_norm_order', type=float, default=2.0)
 misc_arg.add_argument('--train_ae', type=str2bool, default=False)
 misc_arg.add_argument('--train_gan', type=str2bool, default=True)
